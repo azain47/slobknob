@@ -162,8 +162,7 @@ impl HookState {
         let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
         let injected = kb.flags.contains(LLKHF_INJECTED);
         let Some(key) = media_key(vk) else {
-            self.on_win(vk, down, injected);
-            return Decision::Pass;
+            return self.on_win(vk, down, injected);
         };
         if kb.dwExtraInfo == MAGIC {
             return Decision::Pass;
@@ -171,10 +170,10 @@ impl HookState {
         self.on_media(key, down, injected)
     }
 
-    fn on_win(&self, vk: VIRTUAL_KEY, down: bool, injected: bool) {
+    fn on_win(&self, vk: VIRTUAL_KEY, down: bool, injected: bool) -> Decision {
         if injected {
             self.win_async_ok.set(false);
-            return;
+            return Decision::Pass;
         }
         self.win_async_ok.set(true);
         if down {
@@ -183,11 +182,18 @@ impl HookState {
             self.win_held();
         }
         let bit = if vk == VK_LWIN { 1 } else { 2 };
+        // Auto-repeat of a held Win after the mask went out: Windows re-arms
+        // Start on any Win down that follows the mask, so drop the repeats.
+        // The key stays down; only the repeats go missing.
+        if down && self.win.get() & bit != 0 && self.start_masked.get() {
+            return Decision::Swallow;
+        }
         let held = if down { self.win.get() | bit } else { self.win.get() & !bit };
         self.win.set(held);
         if !down && held == 0 {
             self.modifier_released();
         }
+        Decision::Pass
     }
 
     fn on_media(&self, key: MediaKey, down: bool, injected: bool) -> Decision {
