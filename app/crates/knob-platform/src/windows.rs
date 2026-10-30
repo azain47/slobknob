@@ -12,30 +12,36 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::mem::offset_of;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering::SeqCst};
-use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+use std::sync::{mpsc, Arc, Condvar, LazyLock, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use knob_core::{Axis, DeviceInfo, Key, KeyCombo, MediaKey, Mods, NamedKey};
-use windows::core::{w, BOOL, HSTRING, PCWSTR, PWSTR};
+use windows::core::{w, BOOL, BSTR, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Devices::HumanInterfaceDevice::{
     HidD_GetProductString, HidP_GetUsages, HidP_Input, HIDP_STATUS_INCOMPATIBLE_REPORT_ID,
     HIDP_STATUS_REPORT_DOES_NOT_EXIST, HIDP_STATUS_SUCCESS, HIDP_STATUS_USAGE_NOT_FOUND, PHIDP_PREPARSED_DATA,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, E_FAIL, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmGetColorizationColor;
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+use windows::Win32::System::Com::{
+    CoCreateInstance, CoInitializeEx, CoSetProxyBlanket, CoUninitialize, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+    COINIT_DISABLE_OLE1DDE, COINIT_MULTITHREADED, EOAC_NONE, RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    GetCurrentProcessId, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, CREATE_NO_WINDOW,
-    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcessId, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+    PROCESS_QUERY_LIMITED_INFORMATION,
+};
+use windows::Win32::System::Variant::{VARIANT, VT_BSTR};
+use windows::Win32::System::Wmi::{
+    IWbemClassObject, IWbemLocator, IWbemServices, WbemLocator, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY,
+    WBEM_FLAG_RETURN_WBEM_COMPLETE, WBEM_INFINITE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Input::{
@@ -1456,58 +1462,156 @@ fn send(inputs: &[INPUT]) {
 
 // --- brightness ------------------------------------------------------------
 
-/// Brightness steps not yet applied.
-static BRIGHTNESS_PENDING: AtomicI32 = AtomicI32::new(0);
-/// A PowerShell job is running and will pick up pending steps.
-static BRIGHTNESS_BUSY: AtomicBool = AtomicBool::new(false);
-
-/// Changes brightness by `steps` × 10 via WMI (built-in panels only). Each
-/// PowerShell run takes about a second, so steps that arrive meanwhile are
-/// applied together by the next run.
-fn brightness_step(steps: i32) {
-    BRIGHTNESS_PENDING.fetch_add(steps, SeqCst);
-    if BRIGHTNESS_BUSY.swap(true, SeqCst) {
-        return;
+/// The brightness thread's inbox: knob steps (±1 is ±10 %). Started on first use.
+static BRIGHTNESS: LazyLock<Option<mpsc::Sender<i32>>> = LazyLock::new(|| {
+    let (tx, rx) = mpsc::channel();
+    match thread::Builder::new().name("knob-brightness".into()).spawn(move || brightness_loop(&rx)) {
+        Ok(_) => Some(tx),
+        Err(e) => {
+            log::warn!("could not start the brightness thread: {e}");
+            None
+        }
     }
-    let spawned = thread::Builder::new().name("knob-brightness".into()).spawn(|| loop {
-        let steps = BRIGHTNESS_PENDING.swap(0, SeqCst);
-        if steps != 0 {
-            change_brightness(steps.saturating_mul(10));
-        }
-        BRIGHTNESS_BUSY.store(false, SeqCst);
-        // A step that landed after the swap saw BUSY set and left it to us.
-        if BRIGHTNESS_PENDING.load(SeqCst) == 0 || BRIGHTNESS_BUSY.swap(true, SeqCst) {
-            break;
-        }
-    });
-    if let Err(e) = spawned {
-        BRIGHTNESS_BUSY.store(false, SeqCst);
-        log::warn!("could not start the brightness thread: {e}");
+});
+
+/// Changes brightness by `steps` × 10 % via WMI (built-in panels only), on a
+/// thread of its own that keeps the WMI connection. Steps that arrive while a
+/// change is in flight are applied together by the next one.
+fn brightness_step(steps: i32) {
+    if let Some(tx) = &*BRIGHTNESS {
+        let _ = tx.send(steps);
     }
 }
 
-fn change_brightness(delta: i32) {
-    let script = format!(
-        "$m = Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightness -ErrorAction Stop \
-           | Select-Object -First 1; \
-         if (-not $m) {{ exit 1 }}; \
-         $b = [Math]::Max(0, [Math]::Min(100, [int]$m.CurrentBrightness + ({delta}))); \
-         Get-CimInstance -Namespace root/wmi -ClassName WmiMonitorBrightnessMethods -ErrorAction Stop \
-           | Invoke-CimMethod -MethodName WmiSetBrightness \
-               -Arguments @{{ Timeout = [uint32]0; Brightness = [byte]$b }} | Out-Null"
-    );
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
-        .creation_flags(CREATE_NO_WINDOW.0)
-        .stdin(Stdio::null())
-        .output();
-    match output {
-        Ok(out) if out.status.success() => {}
-        Ok(out) => {
-            log::warn!("brightness change failed ({}): {}", out.status, String::from_utf8_lossy(&out.stderr).trim())
-        }
-        Err(e) => log::warn!("could not run powershell: {e}"),
+fn brightness_loop(rx: &mpsc::Receiver<i32>) {
+    // SAFETY: once, on this thread, which lives as long as the process.
+    if let Err(e) = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.ok() {
+        log::warn!("brightness: CoInitializeEx failed: {e}");
+        return;
     }
+    let mut wmi: Option<BrightnessWmi> = None;
+    while let Ok(first) = rx.recv() {
+        let steps = first + rx.try_iter().sum::<i32>();
+        if steps == 0 {
+            continue;
+        }
+        let started = Instant::now();
+        if wmi.is_none() {
+            match BrightnessWmi::connect() {
+                Ok(connected) => wmi = Some(connected),
+                Err(e) => {
+                    log::warn!("brightness: {e}");
+                    continue;
+                }
+            }
+        }
+        let Some(connection) = &wmi else { continue };
+        match connection.change(steps.saturating_mul(10)) {
+            Ok((from, to)) => log::debug!("brightness {from} -> {to} % in {:?}", started.elapsed()),
+            Err(e) => {
+                log::warn!("brightness change failed: {e}");
+                wmi = None; // reconnect next time
+            }
+        }
+    }
+}
+
+/// A WMI connection to the built-in display's brightness controls.
+struct BrightnessWmi {
+    services: IWbemServices,
+    /// Object path of the WmiMonitorBrightnessMethods instance.
+    methods: BSTR,
+    /// WmiSetBrightness's input parameters, refilled for every call.
+    params: IWbemClassObject,
+}
+
+impl BrightnessWmi {
+    fn connect() -> windows::core::Result<Self> {
+        // SAFETY: COM is initialized on this thread (MTA); every pointer argument is valid or None.
+        unsafe {
+            let locator: IWbemLocator = CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)?;
+            let none = BSTR::new();
+            let services = locator.ConnectServer(&BSTR::from(r"ROOT\WMI"), &none, &none, &none, 0, &none, None)?;
+            // 10 = RPC_C_AUTHN_WINNT, 0 = RPC_C_AUTHZ_NONE
+            CoSetProxyBlanket(
+                &services,
+                10,
+                0,
+                PCWSTR::null(),
+                RPC_C_AUTHN_LEVEL_CALL,
+                RPC_C_IMP_LEVEL_IMPERSONATE,
+                None,
+                EOAC_NONE,
+            )?;
+            let instance = first_object(&services, "SELECT __PATH FROM WmiMonitorBrightnessMethods")?;
+            let methods = bstr_property(&instance, w!("__PATH"))?;
+            let mut class = None;
+            services.GetObject(
+                &BSTR::from("WmiMonitorBrightnessMethods"),
+                WBEM_FLAG_RETURN_WBEM_COMPLETE,
+                None,
+                Some(&mut class),
+                None,
+            )?;
+            let mut signature = None;
+            class.ok_or_else(no_brightness)?.GetMethod(w!("WmiSetBrightness"), 0, &mut signature, std::ptr::null_mut())?;
+            let params = signature.ok_or_else(no_brightness)?.SpawnInstance(0)?;
+            // a CIM uint32 travels as VT_I4
+            params.Put(w!("Timeout"), 0, &VARIANT::from(0i32), 0)?;
+            Ok(Self { services, methods, params })
+        }
+    }
+
+    /// Returns the brightness before and after, in percent.
+    fn change(&self, delta: i32) -> windows::core::Result<(u32, u32)> {
+        let current = first_object(&self.services, "SELECT CurrentBrightness FROM WmiMonitorBrightness")?;
+        let mut value = VARIANT::default();
+        // SAFETY: value is a valid out VARIANT; the optional outputs are None.
+        unsafe { current.Get(w!("CurrentBrightness"), 0, &mut value, None, None) }?;
+        let from = u32::try_from(&value)?;
+        let to = (from as i32).saturating_add(delta).clamp(0, 100) as u32;
+        // SAFETY: valid VARIANT and object path; params is WmiSetBrightness's input signature.
+        unsafe {
+            self.params.Put(w!("Brightness"), 0, &VARIANT::from(to as u8), 0)?;
+            self.services.ExecMethod(
+                &self.methods,
+                &BSTR::from("WmiSetBrightness"),
+                WBEM_FLAG_RETURN_WBEM_COMPLETE,
+                None,
+                &self.params,
+                None,
+                None,
+            )?;
+        }
+        Ok((from, to))
+    }
+}
+
+/// The first object a WQL query returns.
+fn first_object(services: &IWbemServices, query: &str) -> windows::core::Result<IWbemClassObject> {
+    let flags = WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY;
+    // SAFETY: plain query on a live connection.
+    let objects = unsafe { services.ExecQuery(&BSTR::from("WQL"), &BSTR::from(query), flags, None) }?;
+    let mut found = [None];
+    let mut count = 0;
+    // SAFETY: found has room for one object; count is a valid out pointer.
+    unsafe { objects.Next(WBEM_INFINITE, &mut found, &mut count) }.ok()?;
+    found[0].take().ok_or_else(no_brightness)
+}
+
+fn bstr_property(object: &IWbemClassObject, name: PCWSTR) -> windows::core::Result<BSTR> {
+    let mut value = VARIANT::default();
+    // SAFETY: value is a valid out VARIANT; the optional outputs are None.
+    unsafe { object.Get(name, 0, &mut value, None, None) }?;
+    if value.vt() != VT_BSTR {
+        return Err(no_brightness());
+    }
+    // SAFETY: vt says the union holds a BSTR; clone it, `value` frees its own on drop.
+    Ok(unsafe { (*value.Anonymous.Anonymous.Anonymous.bstrVal).clone() })
+}
+
+fn no_brightness() -> windows::core::Error {
+    windows::core::Error::new(E_FAIL, "no built-in display brightness control (WMI)")
 }
 
 // --- queries ---------------------------------------------------------------

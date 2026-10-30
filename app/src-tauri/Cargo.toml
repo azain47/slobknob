@@ -21,3 +21,5 @@ tauri-plugin-autostart = "2"
 
 [target."cfg(windows)".dependencies]
 open = "5"
+webview2-com = "0.39"
+windows-core = "0.62"

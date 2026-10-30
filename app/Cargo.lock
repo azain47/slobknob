@@ -3154,6 +3154,8 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-autostart",
  "tauri-plugin-global-shortcut",
+ "webview2-com",
+ "windows-core",
 ]
 
 [[package]]
