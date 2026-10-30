@@ -1,0 +1,10 @@
+[package]
+name = "knob-core"
+description = "Platform-independent knob wheel state machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

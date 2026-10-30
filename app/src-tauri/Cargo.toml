@@ -1,0 +1,23 @@
+[package]
+name = "slobknob"
+description = "Radial mode wheel for keyboard volume knobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+knob-core = { path = "../crates/knob-core" }
+knob-platform = { path = "../crates/knob-platform" }
+tauri = { version = "2", features = ["macos-private-api", "tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2"
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger = "0.11"
+tauri-plugin-autostart = "2"
+
+[target."cfg(windows)".dependencies]
+open = "5"

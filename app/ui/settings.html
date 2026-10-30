@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SlobKnob Settings</title>
+  <link rel="stylesheet" href="settings.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="drag-strip" data-tauri-drag-region></div>
+      <div class="brand" data-tauri-drag-region>
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name" data-tauri-drag-region>SlobKnob</span>
+      </div>
+      <nav id="nav" class="nav" aria-label="Settings sections"></nav>
+      <div class="side-foot">
+        <div id="run-status" class="run-status"></div>
+        <button id="open-config" class="link-btn" type="button">Open config file</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar" data-tauri-drag-region>
+        <h1 id="title" data-tauri-drag-region></h1>
+        <div id="save-status" class="save-status" data-tauri-drag-region></div>
+      </header>
+      <div id="scroller" class="scroller">
+        <div id="banners"></div>
+        <div id="content"></div>
+      </div>
+    </main>
+  </div>
+  <div id="popover-layer"></div>
+  <script type="module" src="settings.js"></script>
+</body>
+</html>

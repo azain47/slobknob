@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SlobKnob</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="dim" class="dim"></div>
+
+  <div id="wheel" class="wheel" aria-hidden="true">
+    <div class="ring-shadow"></div>
+    <svg id="wheel-svg" class="wheel-svg" width="600" height="600" viewBox="-300 -300 600 600">
+      <defs>
+        <!-- Accent glow under the selected slice. flood-color is set from the theme. -->
+        <filter id="kw-glow" filterUnits="userSpaceOnUse" x="-300" y="-300" width="600" height="600"
+                color-interpolation-filters="sRGB">
+          <feDropShadow id="kw-glow-shadow" dx="0" dy="0" stdDeviation="11" flood-color="#0a84ff" flood-opacity="0.65"/>
+        </filter>
+      </defs>
+
+      <circle class="ring" r="236"/>
+      <g id="slices"></g>
+      <path id="hl" class="hl none" filter="url(#kw-glow)"/>
+      <g id="items"></g>
+      <circle id="active-dot" class="active-dot none" r="3"/>
+
+      <g class="hub-group">
+        <circle class="hub" r="106"/>
+        <g id="hub-icon" class="hub-icon"></g>
+        <text id="hub-name" class="hub-name" x="0" y="16" text-anchor="middle"></text>
+        <g id="hub-hint" class="hub-hint"></g>
+      </g>
+    </svg>
+    <div id="wheel-title" class="wheel-title"><svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="m15 18-6-6 6-6"/></svg><span id="wheel-title-text"></span></div>
+    <div id="footer" class="footer"></div>
+  </div>
+
+  <div class="hud-wrap">
+    <div id="hud" class="hud" role="status" aria-live="polite">
+      <span class="hud-badge"><svg id="hud-icon" width="20" height="20" viewBox="0 0 24 24" fill="none"
+        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"></svg></span>
+      <span id="hud-text" class="hud-text"></span>
+    </div>
+  </div>
+
+  <script type="module" src="wheel.js"></script>
+</body>
+</html>

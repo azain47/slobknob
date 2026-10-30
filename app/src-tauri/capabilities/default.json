@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The overlay only listens to events and asks for its theme.",
+  "windows": ["overlay"],
+  "permissions": ["core:default"]
+}
