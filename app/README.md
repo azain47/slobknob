@@ -64,13 +64,29 @@ npx tauri build    # .app / .dmg on macOS, .exe / .msi on Windows
 macOS needs Accessibility permission (System Settings > Privacy & Security > Accessibility).
 `cargo run -p knob-platform --example knobcli` runs the hook and engine without UI and prints events.
 
+### Windows .exe from Linux / WSL (no Visual Studio)
+
+```sh
+rustup target add x86_64-pc-windows-msvc
+cargo install --locked cargo-xwin   # downloads the MSVC CRT + Windows SDK on first build
+npx tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --no-bundle
+# -> target/x86_64-pc-windows-msvc/release/slobknob.exe
+```
+
+Needs `clang-cl`, `llvm-rc` and `llvm-lib` (LLVM) and `lld-link` on PATH. Without LLVM's lld, symlink
+rustup's `rust-lld` as `lld-link`; rustup's own `gcc-ld/lld-link` wrapper fails (rustc already passes
+`-flavor link`). `--no-bundle` skips the installer, which would need NSIS.
+
 ## Status
 
 - macOS: tested with simulated knob events (hook, wheel, modes, action and sub-wheel slices, overlay,
   settings window). Device matching was checked with a real AULA F75 in a standalone test, not yet in
   the app.
-- Windows: the platform layer is compile-checked only and has never run on a Windows PC; the app shell
-  (src-tauri) for Windows is not compile-checked at all (its build script needs Windows resource tools).
+- Windows: cross-compiled from WSL (above) and run on Windows 11 with a real AULA F75 on its 2.4G
+  receiver: hook, settings window, wheel overlay and modes work. "Learn my knob" passed with simulated
+  keys but is not yet confirmed with the real knob; "Only use the knob's keyboard" is untested. The
+  F75's knob keys reach the low-level hook flagged as injected (Windows' HID service synthesizes them),
+  so they look like software key presses. A native build (`npx tauri build` on Windows) is untried.
 - Linux: not supported yet.
 - Shortcuts use US-layout key positions, so punctuation shortcuts may differ on other layouts. Typed
   text is layout independent.

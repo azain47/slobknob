@@ -38,4 +38,5 @@ hammerspoon/  The earlier Hammerspoon version for macOS.
               Pause / resume:  open -g "hammerspoon://knobwheel?action=pause"   (or resume)
 ```
 
-Status: macOS works; Windows is written but has never run on a real PC yet.
+Status: macOS works; Windows runs and works with a real AULA F75, with a few features still unconfirmed
+(see app/README.md).
