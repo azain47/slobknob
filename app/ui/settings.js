@@ -817,7 +817,15 @@ function renderWheels() {
     "div",
     { class: "split" },
     h("div", { class: "split-main" }, chips, editor),
-    h("div", { class: "split-side" }, previewPanel("Click a slice, or turn your knob: while this window is in front, the knob only moves the preview.")),
+    h(
+      "div",
+      { class: "split-side" },
+      previewPanel(
+        cfg.preview_in_settings
+          ? "Click a slice, or turn your knob: while this window is in front, the knob only moves the preview."
+          : "Click a slice to preview it. The knob works as usual while this window is in front (Knob > Preview in Settings).",
+      ),
+    ),
   );
 }
 
@@ -1759,6 +1767,11 @@ function renderKnob() {
       "div",
       { class: "card" },
       row("Invert direction", "Swap clockwise and counter-clockwise for everything the knob does.", toggle(cfg.invert_direction, (v) => { cfg.invert_direction = v; changed(); })),
+      row(
+        "Preview in Settings",
+        "While this window is in front, turning the knob only moves the preview wheel. Turn off to use the knob as usual here too.",
+        toggle(cfg.preview_in_settings, (v) => { cfg.preview_in_settings = v; changed(); }),
+      ),
       row(
         "Only use the knob's keyboard",
         h(

@@ -34,8 +34,8 @@ use windows::Win32::Storage::FileSystem::{
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
-    GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, CREATE_NO_WINDOW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    GetCurrentProcessId, GetCurrentThreadId, OpenProcess, QueryFullProcessImageNameW, CREATE_NO_WINDOW,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Input::{
@@ -45,11 +45,12 @@ use windows::Win32::UI::Input::{
 };
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, GetCursorPos, GetForegroundWindow,
-    GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, HC_ACTION, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, PM_NOREMOVE,
-    SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNORMAL, WHEEL_DELTA,
-    WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_INPUT, WM_KEYDOWN, WM_QUIT, WM_SYSKEYDOWN, WM_USER,
+    CallNextHookEx, CreateWindowExW, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetForegroundWindow,
+    GetMessageW, GetSystemMetrics, GetWindowThreadProcessId, PeekMessageW, PostMessageW, PostThreadMessageW,
+    SetWindowsHookExW, UnhookWindowsHookEx, HC_ACTION, HWND_MESSAGE, KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG,
+    PM_NOREMOVE, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SW_SHOWNORMAL,
+    WHEEL_DELTA, WH_KEYBOARD_LL, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APPCOMMAND, WM_INPUT, WM_KEYDOWN, WM_QUIT,
+    WM_SYSKEYDOWN, WM_USER,
 };
 
 use crate::{Action, Decision, HookEvent, InputEvent, KeyHandler, PlatformError};
@@ -1017,6 +1018,10 @@ fn held() -> MutexGuard<'static, Held> {
 pub fn perform(action: &Action) {
     match action {
         Action::Media(media) => match media_vk(*media) {
+            // Our own window in front is the settings window, where the app
+            // makes the knob keys hotkeys: a keystroke would land on the
+            // hotkey again. The shell does the same thing without one.
+            Some(_) if own_foreground() && shell_app_command(*media) => {}
             Some(vk) => tap(&[], vk),
             None => brightness_step(if *media == MediaKey::BrightnessUp { 1 } else { -1 }),
         },
@@ -1525,6 +1530,41 @@ pub fn frontmost_app() -> Option<String> {
     queried.ok()?;
     let path = String::from_utf16_lossy(buf.get(..len as usize)?);
     Path::new(&path).file_stem().map(|s| s.to_string_lossy().into_owned())
+}
+
+/// Whether `hwnd` is the foreground window. Unlike its keyboard focus, this
+/// stays true while a child window (a WebView2) has the focus.
+pub fn is_foreground(hwnd: *mut std::ffi::c_void) -> bool {
+    // SAFETY: no preconditions.
+    unsafe { GetForegroundWindow() }.0 == hwnd
+}
+
+fn own_foreground() -> bool {
+    let mut pid = 0u32;
+    // SAFETY: pid is a valid out pointer; a null window yields pid 0.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), Some(&mut pid as *mut u32)) };
+    // SAFETY: no preconditions.
+    pid == unsafe { GetCurrentProcessId() }
+}
+
+/// A media key as WM_APPCOMMAND to the taskbar: Explorer changes the volume
+/// (with its flyout) or controls media as if the key was pressed. False if
+/// there is no taskbar to ask.
+fn shell_app_command(key: MediaKey) -> bool {
+    let command: isize = match key {
+        MediaKey::Mute => 8,
+        MediaKey::VolumeDown => 9,
+        MediaKey::VolumeUp => 10,
+        MediaKey::Next => 11,
+        MediaKey::Previous => 12,
+        MediaKey::PlayPause => 14,
+        MediaKey::BrightnessUp | MediaKey::BrightnessDown => return false,
+    };
+    // SAFETY: plain window lookup and a posted message; no pointers kept.
+    unsafe {
+        let Ok(taskbar) = FindWindowW(w!("Shell_TrayWnd"), None) else { return false };
+        PostMessageW(Some(taskbar), WM_APPCOMMAND, WPARAM(taskbar.0 as usize), LPARAM(command << 16)).is_ok()
+    }
 }
 
 pub fn accent_color() -> Option<[u8; 3]> {

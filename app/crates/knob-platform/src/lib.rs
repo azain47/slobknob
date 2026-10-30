@@ -88,7 +88,10 @@ pub use macos::{accent_color, device_permission, frontmost_app, input_permission
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{accent_color, device_permission, frontmost_app, input_permission, perform, set_device_listener, start_hook, Hook};
+pub use windows::{
+    accent_color, device_permission, frontmost_app, input_permission, is_foreground, perform, set_device_listener, start_hook,
+    Hook,
+};
 
 #[cfg(not(any(target_os = "macos", windows)))]
 mod unsupported;

@@ -8,7 +8,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
-use knob_core::{Config, Decision, Effect, Engine, KnobKey, LearnEvent, UiEvent};
+use knob_core::{Action, Config, Decision, Effect, Engine, InputEvent, KnobKey, LearnEvent, MediaKey, UiEvent};
 
 use crate::{device_permission, frontmost_app, perform, set_device_listener, start_hook, Hook, HookEvent, PlatformError};
 
@@ -170,6 +170,17 @@ impl Runtime {
 
     pub fn cancel_wheel(&self) {
         self.shared.with(|e| ((), e.cancel_wheel()));
+    }
+
+    /// A media key that reached the app some other way than the hook (Windows:
+    /// a hotkey while the settings window is in front). Runs it as the hook
+    /// would. The key itself is already consumed, so "pass" is carried out as
+    /// an action instead.
+    pub fn feed_key(&self, key: MediaKey, down: bool, modifier: bool) {
+        let ev = InputEvent { key, down, repeat: false, modifier, device: None };
+        if on_hook_event(&self.shared, HookEvent::Key(ev)) == Decision::Pass && down {
+            self.shared.send(vec![Effect::Perform(Action::Media(key))]);
+        }
     }
 
     /// Pick a mode for the wheel of `front_app` (tray menu).

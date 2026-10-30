@@ -23,7 +23,8 @@ an app, file or URL, type a piece of text, press a media key, or open a **sub-wh
 Pausing on an action never runs it; tap the knob (or let go of Cmd / Win) to run it.
 
 **Settings window** (tray > Settings…, or `slobknob --settings`): edit wheels and actions with a live
-preview that follows the real knob while the window is in front, learn your knob, and change timing,
+preview that follows the real knob while the window is in front (turn off Knob > Preview in Settings to
+use the knob normally there instead), learn your knob, and change timing,
 scrolling and appearance. Everything is saved to `config.json` (macOS:
 `~/Library/Application Support/app.slobknob/`, Windows: `%APPDATA%\app.slobknob\`), which can also be
 edited by hand ("Reload Config" in the tray).

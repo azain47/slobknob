@@ -127,6 +127,9 @@ pub struct Config {
     pub knob_keys: KnobKeys,
     /// Swap clockwise and counter-clockwise for everything the knob does.
     pub invert_direction: bool,
+    /// While the settings window is in front, the knob only moves its preview
+    /// wheel. Off: the knob works as usual there too.
+    pub preview_in_settings: bool,
     /// The keyboard the knob is on, if learned.
     pub knob_device: Option<DeviceInfo>,
     /// Only treat keys from `knob_device` as the knob, so volume keys on other
@@ -169,6 +172,7 @@ impl Default for Config {
             actions: Vec::new(),
             knob_keys: KnobKeys::default(),
             invert_direction: false,
+            preview_in_settings: true,
             knob_device: None,
             only_knob_device: false,
             launch_at_login: false,

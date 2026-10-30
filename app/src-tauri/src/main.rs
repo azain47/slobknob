@@ -33,9 +33,9 @@ pub struct AppState {
     starting: AtomicBool,
     /// The thread dropping a paused runtime; joined before the next start.
     stopping: Mutex<Option<JoinHandle<()>>>,
-    /// Whether the runtime should be in preview mode (settings window focused).
-    /// Re-applied to every new runtime.
-    preview_wanted: AtomicBool,
+    /// Whether the settings window is in front. The runtime is in preview mode
+    /// while it is, if `preview_in_settings` is on. Re-applied to every new runtime.
+    settings_in_front: AtomicBool,
 }
 
 #[derive(Clone, Serialize)]
@@ -228,11 +228,12 @@ pub fn reload_config(app: &AppHandle) {
     let state = app.state::<AppState>();
     let cfg = settings::load_config(&state.paths.config);
     *state.config.lock().unwrap() = cfg.clone();
-    // set_config keeps the preview flag, so nothing to re-apply here
     let _ = app.emit_to(wheel_window::LABEL, "knob-theme", theme(&cfg));
     if let Some(rt) = state.runtime.lock().unwrap().as_ref() {
         rt.set_config(cfg);
     }
+    // the preview flag and the knob hotkeys depend on the config
+    settings_window::apply_preview(app);
     tray::refresh(app);
 }
 
@@ -284,7 +285,7 @@ fn main() {
                 paused: AtomicBool::new(false),
                 starting: AtomicBool::new(false),
                 stopping: Mutex::new(None),
-                preview_wanted: AtomicBool::new(false),
+                settings_in_front: AtomicBool::new(false),
             });
             wheel_window::create(&handle)?;
             tray::create(&handle)?;

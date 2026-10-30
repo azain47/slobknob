@@ -46,7 +46,7 @@ fn native_handle(win: &WebviewWindow) -> tauri::Result<*mut c_void> {
     #[cfg(target_os = "macos")]
     return win.ns_window();
     #[cfg(windows)]
-    return win.hwnd().map(|h| h.0 as *mut c_void);
+    return win.hwnd().map(|h| h.0);
     #[cfg(not(any(target_os = "macos", windows)))]
     return Ok(std::ptr::null_mut());
 }
