@@ -78,6 +78,14 @@ Needs `clang-cl`, `llvm-rc` and `llvm-lib` (LLVM) and `lld-link` on PATH. Withou
 rustup's `rust-lld` as `lld-link`; rustup's own `gcc-ld/lld-link` wrapper fails (rustc already passes
 `-flavor link`). `--no-bundle` skips the installer, which would need NSIS.
 
+### Releases
+
+CI (`.github/workflows/build.yml`) runs tests and clippy and builds the installers on every push. To
+release, set `version` in `src-tauri/tauri.conf.json`, commit, and push a matching tag (`git tag v0.2.0 &&
+git push origin v0.2.0`): CI attaches a universal macOS `.dmg` and the Windows `-setup.exe` / `.msi` to a
+draft GitHub Release, which you then publish. Builds are unsigned (macOS ad-hoc): macOS needs right-click >
+Open the first time, and Windows SmartScreen asks once.
+
 ## Status
 
 - macOS: tested with simulated knob events (hook, wheel, modes, action and sub-wheel slices, overlay,
