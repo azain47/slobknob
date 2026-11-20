@@ -8,7 +8,7 @@ mod tray;
 mod wheel_window;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -22,16 +22,35 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 use settings::Paths;
 use wheel_window::WheelWindow;
 
+/// Whether the knob hook runs. Only `Running` has a runtime.
+pub enum Lifecycle {
+    /// The starter thread is trying; `waiting` once the Accessibility
+    /// permission turned out to be missing.
+    Starting { waiting: bool },
+    Running(Runtime),
+    /// Could not start; pausing and resuming tries again.
+    Failed(String),
+    /// Paused from the tray. `starter`: the starter thread hasn't seen the
+    /// pause yet, so a resume hands the start back to it.
+    Paused { starter: bool },
+}
+
+impl Lifecycle {
+    pub fn runtime(&self) -> Option<&Runtime> {
+        match self {
+            Lifecycle::Running(rt) => Some(rt),
+            _ => None,
+        }
+    }
+}
+
 pub struct AppState {
     paths: Paths,
     config: Mutex<Config>,
     modes: Mutex<HashMap<String, String>>,
-    runtime: Mutex<Option<Runtime>>,
     wheel_window: WheelWindow,
-    /// Paused from the tray: no runtime, no hook.
-    paused: AtomicBool,
-    /// A start_when_permitted loop is running.
-    starting: AtomicBool,
+    /// Whether the knob hook runs.
+    lifecycle: Mutex<Lifecycle>,
     /// The thread dropping a paused runtime; joined before the next start.
     stopping: Mutex<Option<JoinHandle<()>>>,
     /// Whether the settings window is in front. The runtime is in preview mode
@@ -74,7 +93,7 @@ fn set_escape(app: &AppHandle, wheel_open: bool) {
         if wheel_open && !registered {
             let result = gs.on_shortcut(ESCAPE, |app, _shortcut, event| {
                 if event.state == ShortcutState::Pressed {
-                    if let Some(rt) = app.state::<AppState>().runtime.lock().unwrap().as_ref() {
+                    if let Some(rt) = app.state::<AppState>().lifecycle.lock().unwrap().runtime() {
                         rt.cancel_wheel();
                     }
                 }
@@ -139,72 +158,101 @@ struct PreviewEvent {
     down: bool,
 }
 
-/// Starts the knob hook, waiting for the Accessibility permission if needed.
-/// Does nothing while paused or if a start is already under way.
+/// Resume or retry: start the hook unless it runs or a start is under way.
 fn start_when_permitted(app: AppHandle) {
     let state = app.state::<AppState>();
-    if state.paused.load(Ordering::Acquire) || state.starting.swap(true, Ordering::AcqRel) {
-        return;
+    let mut lifecycle = state.lifecycle.lock().unwrap();
+    match *lifecycle {
+        Lifecycle::Running(_) | Lifecycle::Starting { .. } => {}
+        // the starter thread is still alive: hand the start back to it
+        Lifecycle::Paused { starter: true } => *lifecycle = Lifecycle::Starting { waiting: false },
+        Lifecycle::Paused { starter: false } | Lifecycle::Failed(_) => {
+            *lifecycle = Lifecycle::Starting { waiting: false };
+            drop(lifecycle);
+            spawn_starter(app.clone());
+        }
     }
+}
+
+/// Starts the runtime, waiting for the Accessibility permission if needed,
+/// for as long as the state stays `Starting`.
+fn spawn_starter(app: AppHandle) {
     std::thread::spawn(move || {
         let state = app.state::<AppState>();
         // a paused runtime may still be shutting down; never run two hooks
         if let Some(t) = state.stopping.lock().unwrap().take() {
             let _ = t.join();
         }
-        let mut asked = false;
-        let mut failed = false;
-        loop {
-            if state.paused.load(Ordering::Acquire) || state.runtime.lock().unwrap().is_some() {
+        let mut first = true;
+        while starting(&app) {
+            let started = if input_permission(first) {
+                match start_runtime(&app) {
+                    Ok(rt) => Some(Ok(rt)),
+                    Err(PlatformError::PermissionDenied) => None,
+                    Err(e) => Some(Err(e)),
+                }
+            } else {
+                None
+            };
+            let mut lifecycle = state.lifecycle.lock().unwrap();
+            if !matches!(*lifecycle, Lifecycle::Starting { .. }) {
+                // paused meanwhile
+                if let Lifecycle::Paused { starter } = &mut *lifecycle {
+                    *starter = false;
+                }
+                drop(lifecycle);
+                if let Some(Ok(rt)) = started {
+                    drop_runtime(&app, rt);
+                }
                 break;
             }
-            if input_permission(!asked) {
-                match start_runtime(&app) {
-                    Ok(rt) => {
-                        *state.runtime.lock().unwrap() = Some(rt);
-                        // the new engine starts with preview off
-                        settings_window::apply_preview(&app);
-                        log::info!("knob hook running");
-                        break;
-                    }
-                    Err(PlatformError::PermissionDenied) => {}
-                    Err(e) => {
-                        log::error!("cannot start: {e}");
-                        tray::set_status(&app, &format!("Error: {e}"));
-                        failed = true;
-                        break;
-                    }
+            match started {
+                Some(Ok(rt)) => {
+                    *lifecycle = Lifecycle::Running(rt);
+                    drop(lifecycle);
+                    // the new engine starts with preview off
+                    settings_window::apply_preview(&app);
+                    log::info!("knob hook running");
+                    break;
                 }
+                Some(Err(e)) => {
+                    log::error!("cannot start: {e}");
+                    *lifecycle = Lifecycle::Failed(e.to_string());
+                    break;
+                }
+                None => *lifecycle = Lifecycle::Starting { waiting: true },
             }
-            if !asked {
-                tray::set_status(&app, "Waiting for Accessibility permission…");
-            }
-            asked = true;
+            drop(lifecycle);
+            tray::refresh(&app);
+            first = false;
             std::thread::sleep(Duration::from_secs(2));
-        }
-        state.starting.store(false, Ordering::Release);
-        if state.paused.load(Ordering::Acquire) {
-            // paused while starting: undo
-            stop_runtime(&app);
-        } else if !failed && state.runtime.lock().unwrap().is_none() {
-            // resumed again after this loop saw the pause (that resume found
-            // `starting` set and left it to us)
-            start_when_permitted(app.clone());
         }
         tray::refresh(&app);
     });
 }
 
-/// Drops the runtime (removing the hook) on a background thread, since Drop
-/// joins the runtime's threads.
-fn stop_runtime(app: &AppHandle) {
+/// Whether the starter thread should keep trying. When it should not, it
+/// tells a paused state that the starter is gone.
+fn starting(app: &AppHandle) -> bool {
     let state = app.state::<AppState>();
-    let rt = state.runtime.lock().unwrap().take();
-    if let Some(rt) = rt {
-        let t = std::thread::spawn(move || drop(rt));
-        if let Some(old) = state.stopping.lock().unwrap().replace(t) {
-            let _ = old.join();
+    let mut lifecycle = state.lifecycle.lock().unwrap();
+    match &mut *lifecycle {
+        Lifecycle::Starting { .. } => true,
+        Lifecycle::Paused { starter } => {
+            *starter = false;
+            false
         }
+        _ => false,
+    }
+}
+
+/// Drops a runtime (removing the hook) on a background thread, since Drop
+/// joins the runtime's threads.
+fn drop_runtime(app: &AppHandle, rt: Runtime) {
+    let state = app.state::<AppState>();
+    let t = std::thread::spawn(move || drop(rt));
+    if let Some(old) = state.stopping.lock().unwrap().replace(t) {
+        let _ = old.join();
     }
     // a wheel or HUD that was up stays on screen otherwise
     state.wheel_window.handle(UiEvent::Close);
@@ -213,18 +261,29 @@ fn stop_runtime(app: &AppHandle) {
 
 pub fn set_paused(app: &AppHandle, paused: bool) {
     let state = app.state::<AppState>();
-    if state.paused.swap(paused, Ordering::AcqRel) == paused {
-        return;
-    }
     if paused {
-        stop_runtime(app);
+        let mut lifecycle = state.lifecycle.lock().unwrap();
+        match std::mem::replace(&mut *lifecycle, Lifecycle::Paused { starter: false }) {
+            Lifecycle::Paused { starter } => {
+                *lifecycle = Lifecycle::Paused { starter };
+                return;
+            }
+            Lifecycle::Starting { .. } => *lifecycle = Lifecycle::Paused { starter: true },
+            Lifecycle::Running(rt) => {
+                drop(lifecycle);
+                drop_runtime(app, rt);
+            }
+            Lifecycle::Failed(_) => {}
+        }
         log::info!("paused");
-        tray::refresh(app);
     } else {
+        if !matches!(*state.lifecycle.lock().unwrap(), Lifecycle::Paused { .. }) {
+            return;
+        }
         log::info!("resuming");
         start_when_permitted(app.clone());
-        tray::refresh(app);
     }
+    tray::refresh(app);
 }
 
 pub fn reload_config(app: &AppHandle) {
@@ -233,7 +292,7 @@ pub fn reload_config(app: &AppHandle) {
     *state.config.lock().unwrap() = cfg.clone();
     let _ = app.emit_to(wheel_window::LABEL, "knob-theme", theme(&cfg));
     lights::apply(&cfg);
-    if let Some(rt) = state.runtime.lock().unwrap().as_ref() {
+    if let Some(rt) = state.lifecycle.lock().unwrap().runtime() {
         rt.set_config(cfg);
     }
     // the preview flag and the knob hotkeys depend on the config
@@ -285,10 +344,8 @@ fn main() {
                 paths,
                 config: Mutex::new(config),
                 modes: Mutex::new(modes),
-                runtime: Mutex::new(None),
+                lifecycle: Mutex::new(Lifecycle::Starting { waiting: false }),
                 wheel_window: WheelWindow::new(handle.clone()),
-                paused: AtomicBool::new(false),
-                starting: AtomicBool::new(false),
                 stopping: Mutex::new(None),
                 settings_in_front: AtomicBool::new(false),
             });
@@ -298,7 +355,7 @@ fn main() {
             if let Some(tab) = settings_flag().or(first_run.then(String::new)) {
                 settings_window::open(&handle, (!tab.is_empty()).then_some(tab));
             }
-            start_when_permitted(handle);
+            spawn_starter(handle);
             Ok(())
         })
         .build(tauri::generate_context!())

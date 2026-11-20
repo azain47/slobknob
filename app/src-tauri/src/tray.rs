@@ -1,21 +1,15 @@
 //! Menu bar / system tray: pick a mode, settings, pause, open or reload the config, quit.
 
-use std::sync::atomic::Ordering;
-use std::sync::Mutex;
-
 use knob_core::{mode_def, DEFAULT_WHEEL_KEY};
 use tauri::image::Image;
 use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 
-use crate::AppState;
+use crate::{AppState, Lifecycle};
 
 const TRAY_ID: &str = "slobknob";
 const MODE_PREFIX: &str = "mode:";
-
-/// Status line shown at the top of the menu (e.g. waiting for permission).
-static STATUS: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn create(app: &AppHandle) -> tauri::Result<TrayIcon> {
     let icon = Image::from_bytes(include_bytes!("../icons/tray.png"))?;
@@ -27,11 +21,6 @@ pub fn create(app: &AppHandle) -> tauri::Result<TrayIcon> {
         .show_menu_on_left_click(true)
         .on_menu_event(on_menu_event)
         .build(app)
-}
-
-pub fn set_status(app: &AppHandle, text: &str) {
-    *STATUS.lock().unwrap() = Some(text.to_string());
-    refresh(app);
 }
 
 /// Rebuild the menu (current mode changed, config reloaded, ...).
@@ -48,17 +37,19 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let state = app.state::<AppState>();
     let cfg = state.config.lock().unwrap().clone();
     let current = state.modes.lock().unwrap().get(DEFAULT_WHEEL_KEY).cloned();
-    let running = state.runtime.lock().unwrap().is_some();
-    let paused = state.paused.load(Ordering::Acquire);
+    let (status, running, paused) = {
+        let lifecycle = state.lifecycle.lock().unwrap();
+        let status = match &*lifecycle {
+            Lifecycle::Running(_) => "SlobKnob".to_string(),
+            Lifecycle::Paused { .. } => "SlobKnob: paused".to_string(),
+            Lifecycle::Starting { waiting: false } => "SlobKnob: starting…".to_string(),
+            Lifecycle::Starting { waiting: true } => "Waiting for Accessibility permission…".to_string(),
+            Lifecycle::Failed(e) => format!("Error: {e}"),
+        };
+        (status, lifecycle.runtime().is_some(), matches!(*lifecycle, Lifecycle::Paused { .. }))
+    };
 
     let menu = Menu::new(app)?;
-    let status = if running {
-        "SlobKnob".to_string()
-    } else if paused {
-        "SlobKnob: paused".to_string()
-    } else {
-        STATUS.lock().unwrap().clone().unwrap_or_else(|| "SlobKnob: starting…".into())
-    };
     menu.append(&MenuItem::with_id(app, "status", status, false, None::<&str>)?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
 
@@ -83,7 +74,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     let id = event.id().as_ref();
     if let Some(mode) = id.strip_prefix(MODE_PREFIX) {
-        if let Some(rt) = app.state::<AppState>().runtime.lock().unwrap().as_ref() {
+        if let Some(rt) = app.state::<AppState>().lifecycle.lock().unwrap().runtime() {
             rt.set_mode_for_app(None, mode);
         }
         return;
@@ -91,7 +82,7 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match id {
         "settings" => crate::settings_window::open(app, None),
         "pause" => {
-            let paused = app.state::<AppState>().paused.load(Ordering::Acquire);
+            let paused = matches!(*app.state::<AppState>().lifecycle.lock().unwrap(), Lifecycle::Paused { .. });
             crate::set_paused(app, !paused);
         }
         "open-config" => {

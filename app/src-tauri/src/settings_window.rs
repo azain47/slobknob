@@ -126,7 +126,7 @@ fn window_gone(app: &AppHandle, destroyed: bool) {
     log::debug!("settings window {}; preview off", if destroyed { "destroyed" } else { "closing" });
     let state = app.state::<AppState>();
     state.settings_in_front.store(false, Ordering::Release);
-    if let Some(rt) = state.runtime.lock().unwrap().as_ref() {
+    if let Some(rt) = state.lifecycle.lock().unwrap().runtime() {
         rt.set_preview(false);
         // an abandoned "learn my knob" swallows every media key until it times out
         rt.cancel_learn();
@@ -146,10 +146,10 @@ fn window_gone(app: &AppHandle, destroyed: bool) {
 pub fn apply_preview(app: &AppHandle) {
     let state = app.state::<AppState>();
     let preview_enabled = state.config.lock().unwrap().preview_in_settings;
-    let guard = state.runtime.lock().unwrap();
+    let guard = state.lifecycle.lock().unwrap();
     // Knob hotkeys: None = off, Some(learning).
     let mut hotkeys = None;
-    if let Some(rt) = guard.as_ref() {
+    if let Some(rt) = guard.runtime() {
         let front = state.settings_in_front.load(Ordering::Acquire);
         let on = front && preview_enabled;
         log::trace!("preview {}", if on { "on" } else { "off" });
@@ -222,7 +222,7 @@ mod knob_hotkeys {
                 match (wanted.contains(&key), gs.is_registered(shortcut)) {
                     (true, false) => {
                         let result = gs.on_shortcut(shortcut, move |app, _shortcut, event| {
-                            if let Some(rt) = app.state::<AppState>().runtime.lock().unwrap().as_ref() {
+                            if let Some(rt) = app.state::<AppState>().lifecycle.lock().unwrap().runtime() {
                                 rt.feed_key(key, event.state == ShortcutState::Pressed, modifier);
                             }
                         });

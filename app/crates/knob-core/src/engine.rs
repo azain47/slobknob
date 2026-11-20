@@ -20,14 +20,54 @@ fn ms(n: u64) -> Duration {
     Duration::from_millis(n)
 }
 
-/// Clears `slot` and returns true if it holds a deadline at or before `now`.
-fn take_due(slot: &mut Option<Instant>, now: Instant) -> bool {
-    if slot.is_some_and(|t| t <= now) {
-        *slot = None;
-        true
-    } else {
-        false
+/// The knob press gesture between knob events.
+enum Press {
+    Idle,
+    /// Double-tap trigger: a single tap waits until `at` for a second one.
+    TapPending { at: Instant, wheel_key: String },
+    /// Hold trigger, knob down. The wheel opens at `open_at`; None once a
+    /// wheel opened.
+    Holding { open_at: Option<Instant>, wheel_key: String },
+    /// Knob down, and its release does nothing (this press picked a slice or
+    /// opened the wheel).
+    SwallowUp,
+}
+
+impl Press {
+    fn deadline(&self) -> Option<Instant> {
+        match self {
+            Press::TapPending { at, .. } => Some(*at),
+            Press::Holding { open_at, .. } => *open_at,
+            Press::Idle | Press::SwallowUp => None,
+        }
     }
+}
+
+/// Held down by the knob between turns; let go at `release_at` or on a mode change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Held {
+    /// Apps mode: the app switcher's modifier.
+    AppSwitch { release_at: Instant },
+    /// Drag mode: the mouse button.
+    Drag { release_at: Instant },
+}
+
+impl Held {
+    fn release_at(self) -> Instant {
+        match self {
+            Held::AppSwitch { release_at } | Held::Drag { release_at } => release_at,
+        }
+    }
+}
+
+/// Idle fallback to volume mode for one wheel.
+struct Revert {
+    at: Instant,
+    wheel_key: String,
+}
+
+fn due(at: Option<Instant>, now: Instant) -> bool {
+    at.is_some_and(|t| t <= now)
 }
 
 struct OpenWheel {
@@ -41,32 +81,18 @@ struct OpenWheel {
     /// released after a hold without turning).
     sticky: bool,
     rotated_while_held: bool,
-}
-
-#[derive(Default)]
-struct Deadlines {
-    /// Double-tap trigger: a single tap is waiting to see if a second follows.
-    tap: Option<Instant>,
-    /// Hold trigger: open the wheel if still pressed.
-    hold: Option<Instant>,
-    confirm: Option<Instant>,
-    wheel_timeout: Option<Instant>,
-    app_switch: Option<Instant>,
-    drag: Option<Instant>,
-    revert: Option<Instant>,
-    learn: Option<Instant>,
-}
-
-impl Deadlines {
-    fn all(&self) -> [Option<Instant>; 8] {
-        [self.tap, self.hold, self.confirm, self.wheel_timeout, self.app_switch, self.drag, self.revert, self.learn]
-    }
+    /// Auto-confirm: pick the highlight at this time.
+    confirm_at: Option<Instant>,
+    /// Close untouched at this time.
+    timeout_at: Instant,
 }
 
 struct Learn {
     step: KnobKey,
     keys: Vec<MediaKey>,
     device: Option<DeviceInfo>,
+    /// Gives up at this time unless another key comes.
+    deadline: Instant,
 }
 
 /// The knob state machine. Not thread-safe by itself; wrap it in a mutex and
@@ -76,23 +102,18 @@ pub struct Engine {
     /// Selected mode per wheel key.
     modes: HashMap<String, String>,
     wheel: Option<OpenWheel>,
-    pressing: bool,
-    swallow_next_up: bool,
-    /// Wheel key at the time of the last press, for actions that fire later.
-    press_wheel_key: String,
-    revert_wheel_key: String,
+    press: Press,
     /// Rotation key-ups get the same decision as their key-down.
     passing: HashMap<KnobKey, bool>,
     scroll_axis: Axis,
     drag_axis: Axis,
-    app_switch_active: bool,
-    drag_active: bool,
+    held: Option<Held>,
     /// Last scroll turn, for acceleration.
     last_scroll: Option<(Instant, i8)>,
     learn: Option<Learn>,
     /// Settings window in front: knob turns only move its preview.
     preview: bool,
-    deadlines: Deadlines,
+    revert: Option<Revert>,
 }
 
 impl Engine {
@@ -101,19 +122,15 @@ impl Engine {
             cfg: cfg.sanitized(),
             modes: saved_modes,
             wheel: None,
-            pressing: false,
-            swallow_next_up: false,
-            press_wheel_key: String::new(),
-            revert_wheel_key: String::new(),
+            press: Press::Idle,
             passing: HashMap::new(),
             scroll_axis: Axis::Vertical,
             drag_axis: Axis::Horizontal,
-            app_switch_active: false,
-            drag_active: false,
+            held: None,
             last_scroll: None,
             learn: None,
             preview: false,
-            deadlines: Deadlines::default(),
+            revert: None,
         }
     }
 
@@ -209,17 +226,15 @@ impl Engine {
         let mut fx = Vec::new();
         self.close_wheel(&mut fx);
         self.release_held(&mut fx);
-        self.deadlines.tap = None;
-        self.deadlines.hold = None;
-        self.learn = Some(Learn { step: KnobKey::Clockwise, keys: Vec::new(), device: None });
-        self.deadlines.learn = Some(now + ms(LEARN_TIMEOUT_MS));
+        self.press = Press::Idle;
+        self.passing.clear();
+        self.learn = Some(Learn { step: KnobKey::Clockwise, keys: Vec::new(), device: None, deadline: now + ms(LEARN_TIMEOUT_MS) });
         fx.push(Effect::Learn(LearnEvent::Prompt { step: KnobKey::Clockwise }));
         fx
     }
 
     pub fn cancel_learn(&mut self) -> Vec<Effect> {
         let mut fx = Vec::new();
-        self.deadlines.learn = None;
         if self.learn.take().is_some() {
             fx.push(Effect::Learn(LearnEvent::Cancelled));
         }
@@ -232,8 +247,8 @@ impl Engine {
         if on && !self.preview {
             self.close_wheel(&mut fx);
             self.release_held(&mut fx);
-            self.deadlines.tap = None;
-            self.deadlines.hold = None;
+            self.press = Press::Idle;
+            self.passing.clear();
         }
         self.preview = on;
         fx
@@ -281,31 +296,30 @@ impl Engine {
     /// Run every timer that is due.
     pub fn tick(&mut self, now: Instant) -> Vec<Effect> {
         let mut fx = Vec::new();
-        if take_due(&mut self.deadlines.tap, now) {
-            let key = self.press_wheel_key.clone();
-            self.run_press(&key, &mut fx);
+        if due(self.press.deadline(), now) {
+            match std::mem::replace(&mut self.press, Press::Idle) {
+                Press::TapPending { wheel_key, .. } => self.run_press(&wheel_key, &mut fx),
+                Press::Holding { wheel_key, .. } => {
+                    self.press = Press::Holding { open_at: None, wheel_key: wheel_key.clone() };
+                    self.open_wheel(now, &wheel_key, OpenVia::Hold, &mut fx);
+                }
+                other => self.press = other,
+            }
         }
-        if take_due(&mut self.deadlines.hold, now) {
-            let key = self.press_wheel_key.clone();
-            self.open_wheel(now, &key, OpenVia::Hold, &mut fx);
-        }
-        if take_due(&mut self.deadlines.confirm, now) {
+        if due(self.wheel.as_ref().and_then(|w| w.confirm_at), now) {
             self.commit(now, false, &mut fx);
         }
-        if take_due(&mut self.deadlines.wheel_timeout, now) {
+        if due(self.wheel.as_ref().map(|w| w.timeout_at), now) {
             self.close_wheel(&mut fx);
         }
-        if take_due(&mut self.deadlines.app_switch, now) {
-            self.end_app_switch(&mut fx);
+        if due(self.held.map(Held::release_at), now) {
+            self.release_held(&mut fx);
         }
-        if take_due(&mut self.deadlines.drag, now) {
-            self.end_drag(&mut fx);
+        if let Some(revert) = self.revert.take_if(|r| r.at <= now) {
+            self.set_mode_inner(&revert.wheel_key, "volume", &mut fx);
         }
-        if take_due(&mut self.deadlines.revert, now) {
-            let key = self.revert_wheel_key.clone();
-            self.set_mode_inner(&key, "volume", &mut fx);
-        }
-        if take_due(&mut self.deadlines.learn, now) && self.learn.take().is_some() {
+        if self.learn.as_ref().is_some_and(|l| l.deadline <= now) {
+            self.learn = None;
             fx.push(Effect::Learn(LearnEvent::Cancelled));
         }
         fx
@@ -313,7 +327,18 @@ impl Engine {
 
     /// When [`Engine::tick`] should run next.
     pub fn next_deadline(&self) -> Option<Instant> {
-        self.deadlines.all().into_iter().flatten().min()
+        let wheel = self.wheel.as_ref();
+        [
+            self.press.deadline(),
+            wheel.and_then(|w| w.confirm_at),
+            wheel.map(|w| w.timeout_at),
+            self.held.map(Held::release_at),
+            self.revert.as_ref().map(|r| r.at),
+            self.learn.as_ref().map(|l| l.deadline),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// The wheel modifier was released. A wheel it opened picks the
@@ -361,39 +386,36 @@ impl Engine {
     fn press_down(&mut self, now: Instant, key: &str, fx: &mut Vec<Effect>) {
         if self.wheel.as_ref().is_some_and(|w| w.sticky) {
             self.commit(now, false, fx);
-            self.swallow_next_up = true;
+            self.press = Press::SwallowUp;
             return;
         }
         match self.cfg.trigger {
             Trigger::DoubleTap => {
-                if self.deadlines.tap.take().is_some() {
+                if matches!(self.press, Press::TapPending { .. }) {
                     // second tap: open the wheel instead of running the single-tap action
+                    self.press = Press::Idle;
                     self.open_wheel(now, key, OpenVia::Tap, fx);
-                    self.swallow_next_up = true;
+                    self.press = Press::SwallowUp;
                 }
             }
             Trigger::Hold => {
-                self.pressing = true;
-                self.press_wheel_key = key.to_string();
-                self.deadlines.hold = Some(now + ms(self.cfg.hold_ms));
+                self.press = Press::Holding { open_at: Some(now + ms(self.cfg.hold_ms)), wheel_key: key.to_string() };
             }
         }
     }
 
     fn press_up(&mut self, now: Instant, key: &str, fx: &mut Vec<Effect>) {
-        self.pressing = false;
-        if std::mem::take(&mut self.swallow_next_up) {
+        let press = std::mem::replace(&mut self.press, Press::Idle);
+        if matches!(press, Press::SwallowUp) {
             return;
         }
         match self.cfg.trigger {
             Trigger::DoubleTap => {
-                self.press_wheel_key = key.to_string();
-                self.deadlines.tap = Some(now + ms(self.cfg.double_tap_ms));
+                self.press = Press::TapPending { at: now + ms(self.cfg.double_tap_ms), wheel_key: key.to_string() };
             }
             Trigger::Hold => {
-                if self.deadlines.hold.take().is_some() {
-                    let key = self.press_wheel_key.clone();
-                    self.run_press(&key, fx);
+                if let Press::Holding { open_at: Some(_), wheel_key } = press {
+                    self.run_press(&wheel_key, fx);
                     return;
                 }
                 let Some(w) = &mut self.wheel else { return };
@@ -401,7 +423,7 @@ impl Engine {
                     self.commit(now, false, fx);
                 } else {
                     w.sticky = true;
-                    self.deadlines.wheel_timeout = Some(now + ms(self.cfg.wheel_timeout_ms));
+                    w.timeout_at = now + ms(self.cfg.wheel_timeout_ms);
                 }
             }
         }
@@ -436,24 +458,23 @@ impl Engine {
     /// Returns true if the original key should pass through.
     fn rotate(&mut self, dir: i8, modifier: bool, now: Instant, key: &str, fx: &mut Vec<Effect>) -> bool {
         if let Some(w) = &mut self.wheel {
-            if self.pressing {
+            if matches!(self.press, Press::Holding { .. }) {
                 w.rotated_while_held = true;
             }
             w.sel = (w.sel as isize + dir as isize).rem_euclid(w.list.len() as isize) as usize;
             fx.push(Effect::Ui(UiEvent::Select { selected: w.sel }));
-            self.deadlines.wheel_timeout = Some(now + ms(self.cfg.wheel_timeout_ms));
+            w.timeout_at = now + ms(self.cfg.wheel_timeout_ms);
             // One-off actions (typing text, opening apps) are never fired by just
             // pausing on them; only a tap or the modifier release runs them.
-            let via = w.via;
             let one_off = matches!(self.cfg.slice_def(&w.list[w.sel]), Some(SliceDef::Action(a)) if !matches!(a.kind, ActionKind::Wheel { .. }));
-            self.deadlines.confirm =
-                (self.auto_confirms(via) && !one_off).then(|| now + ms(self.cfg.auto_confirm_ms));
+            let confirm = self.cfg.auto_confirm_ms > 0 && w.via != OpenVia::Modifier && !one_off;
+            w.confirm_at = confirm.then(|| now + ms(self.cfg.auto_confirm_ms));
             return false;
         }
 
         // Modifier + turn opens the wheel on the current mode; later turns move it.
         // Not while Apps mode holds its own (synthetic) Cmd / Alt down.
-        if modifier && self.cfg.modifier_trigger && !self.app_switch_active {
+        if modifier && self.cfg.modifier_trigger && !matches!(self.held, Some(Held::AppSwitch { .. })) {
             self.open_wheel(now, key, OpenVia::Modifier, fx);
             return false;
         }
@@ -481,8 +502,7 @@ impl Engine {
                 }
             }
             "apps" => {
-                self.app_switch_active = true;
-                self.deadlines.app_switch = Some(now + ms(self.cfg.app_switch_commit_ms));
+                self.hold(Held::AppSwitch { release_at: now + ms(self.cfg.app_switch_commit_ms) }, fx);
                 Action::AppSwitchStep(dir)
             }
             "windows" => Action::WindowCycle(dir),
@@ -491,8 +511,7 @@ impl Engine {
             "media" => Action::Media(if dir > 0 { MediaKey::Next } else { MediaKey::Previous }),
             "seek" => Action::Seek { seconds: d * self.cfg.seek_seconds },
             "drag" => {
-                self.drag_active = true;
-                self.deadlines.drag = Some(now + ms(self.cfg.drag_release_ms));
+                self.hold(Held::Drag { release_at: now + ms(self.cfg.drag_release_ms) }, fx);
                 Action::DragStep { axis: self.drag_axis, pixels: d * self.cfg.drag_pixels }
             }
             "jog" => Action::FrameStep(dir),
@@ -522,11 +541,8 @@ impl Engine {
     }
 
     fn arm_revert(&mut self, now: Instant, key: &str, mode: &str) {
-        self.deadlines.revert = None;
-        if self.cfg.revert_after_ms > 0 && mode != "volume" {
-            self.revert_wheel_key = key.to_string();
-            self.deadlines.revert = Some(now + ms(self.cfg.revert_after_ms));
-        }
+        self.revert = (self.cfg.revert_after_ms > 0 && mode != "volume")
+            .then(|| Revert { at: now + ms(self.cfg.revert_after_ms), wheel_key: key.to_string() });
     }
 
     // --- wheel ------------------------------------------------------------
@@ -584,9 +600,17 @@ impl Engine {
             via,
             sticky: via != OpenVia::Hold,
             rotated_while_held: false,
+            confirm_at: None,
+            timeout_at: now + ms(self.cfg.wheel_timeout_ms),
         });
-        self.deadlines.confirm = None;
-        self.deadlines.wheel_timeout = Some(now + ms(self.cfg.wheel_timeout_ms));
+        // The wheel replaces what a pending tap or hold would have done, and the
+        // idle fallback to volume must not change the mode under it.
+        match &mut self.press {
+            Press::TapPending { .. } => self.press = Press::Idle,
+            Press::Holding { open_at, .. } => *open_at = None,
+            Press::Idle | Press::SwallowUp => {}
+        }
+        self.revert = None;
     }
 
     fn slice(&self, id: &str) -> Option<Slice> {
@@ -611,8 +635,6 @@ impl Engine {
     }
 
     fn close_wheel(&mut self, fx: &mut Vec<Effect>) {
-        self.deadlines.confirm = None;
-        self.deadlines.wheel_timeout = None;
         if self.wheel.take().is_some() {
             fx.push(Effect::Ui(UiEvent::Close));
         }
@@ -622,8 +644,6 @@ impl Engine {
     /// opened this wheel is no longer held, so a sub-wheel must not wait for it.
     fn commit(&mut self, now: Instant, modifier_released: bool, fx: &mut Vec<Effect>) {
         let Some(w) = self.wheel.take() else { return };
-        self.deadlines.confirm = None;
-        self.deadlines.wheel_timeout = None;
         let id = &w.list[w.sel];
         let action = match self.cfg.slice_def(id) {
             Some(SliceDef::Mode(_)) | None => None,
@@ -659,7 +679,7 @@ impl Engine {
         if learn.device.is_none() {
             learn.device.clone_from(&ev.device);
         }
-        self.deadlines.learn = Some(now + ms(LEARN_TIMEOUT_MS));
+        learn.deadline = now + ms(LEARN_TIMEOUT_MS);
         let next = match learn.step {
             KnobKey::Clockwise => Some(KnobKey::CounterClockwise),
             KnobKey::CounterClockwise => Some(KnobKey::Press),
@@ -674,7 +694,6 @@ impl Engine {
                 let keys = KnobKeys { clockwise: learn.keys[0], counter_clockwise: learn.keys[1], press: learn.keys[2] };
                 let device = learn.device.take();
                 self.learn = None;
-                self.deadlines.learn = None;
                 fx.push(Effect::Learn(LearnEvent::Done { keys, device }));
             }
         }
@@ -682,7 +701,7 @@ impl Engine {
 
     fn set_mode_inner(&mut self, key: &str, mode: &str, fx: &mut Vec<Effect>) {
         self.release_held(fx);
-        self.deadlines.revert = None;
+        self.revert = None;
         self.modes.insert(key.to_string(), mode.to_string());
         fx.push(Effect::ModeChanged { wheel: key.to_string(), mode: mode.to_string() });
         let name = mode_def(mode).map_or(mode, |m| m.name);
@@ -691,22 +710,31 @@ impl Engine {
 
     // --- held state ---------------------------------------------------------
 
+    /// Starts or extends a hold. A hold of the other kind is let go first.
+    fn hold(&mut self, held: Held, fx: &mut Vec<Effect>) {
+        if self.held.is_some_and(|h| std::mem::discriminant(&h) != std::mem::discriminant(&held)) {
+            self.release_held(fx);
+        }
+        self.held = Some(held);
+    }
+
     fn release_held(&mut self, fx: &mut Vec<Effect>) {
-        self.end_app_switch(fx);
-        self.end_drag(fx);
+        match self.held.take() {
+            Some(Held::AppSwitch { .. }) => fx.push(Effect::Perform(Action::AppSwitchEnd)),
+            Some(Held::Drag { .. }) => fx.push(Effect::Perform(Action::DragEnd)),
+            None => {}
+        }
     }
 
     fn end_app_switch(&mut self, fx: &mut Vec<Effect>) {
-        self.deadlines.app_switch = None;
-        if std::mem::take(&mut self.app_switch_active) {
-            fx.push(Effect::Perform(Action::AppSwitchEnd));
+        if matches!(self.held, Some(Held::AppSwitch { .. })) {
+            self.release_held(fx);
         }
     }
 
     fn end_drag(&mut self, fx: &mut Vec<Effect>) {
-        self.deadlines.drag = None;
-        if std::mem::take(&mut self.drag_active) {
-            fx.push(Effect::Perform(Action::DragEnd));
+        if matches!(self.held, Some(Held::Drag { .. })) {
+            self.release_held(fx);
         }
     }
 }
@@ -1075,6 +1103,27 @@ mod tests {
     }
 
     #[test]
+    fn modifier_wheel_drops_a_pending_single_tap() {
+        let mut r = Rig::new();
+        r.click(Press); // a single tap, waiting for a second
+        modifier_trigger::turn(&mut r, Clockwise);
+        assert!(r.e.is_wheel_open());
+        assert!(performed(&r.wait(300)).is_empty(), "the tap must not mute under the wheel");
+    }
+
+    #[test]
+    fn revert_does_not_change_the_mode_under_an_open_wheel() {
+        let mut r = Rig::with(Config { revert_after_ms: 3000, ..Config::default() });
+        r.e.set_mode(DEFAULT_WHEEL_KEY, "scroll");
+        r.click(Clockwise);
+        r.wait(2000);
+        r.open_wheel();
+        let fx = r.wait(1500);
+        assert!(!fx.iter().any(|f| matches!(f, Effect::ModeChanged { .. })));
+        assert_eq!(r.mode(), "scroll");
+    }
+
+    #[test]
     fn auto_confirm_off_means_only_tap_picks() {
         let mut r = Rig::with(Config { auto_confirm_ms: 0, ..Config::default() });
         r.open_wheel();
@@ -1122,6 +1171,15 @@ mod tests {
             r.click(Press);
             assert_eq!(r.mode(), "brightness");
             assert!(performed(&r.wait(1000)).is_empty());
+        }
+
+        #[test]
+        fn hold_does_not_reopen_a_modifier_wheel() {
+            let mut r = rig();
+            r.ev(Press, true);
+            super::modifier_trigger::turn(&mut r, Clockwise);
+            assert!(r.e.is_wheel_open());
+            assert!(!has_ui(&r.wait(400), |u| matches!(u, UiEvent::Open { .. })));
         }
     }
 

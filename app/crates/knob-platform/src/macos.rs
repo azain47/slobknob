@@ -123,6 +123,15 @@ impl Drop for Hook {
 
 pub fn start_hook(handler: KeyHandler) -> Result<Hook, PlatformError> {
     *HANDLER.write().unwrap_or_else(|e| e.into_inner()) = Some(handler);
+    let hook = spawn_tap();
+    if hook.is_err() {
+        // a failed start must not leave the handler installed
+        *HANDLER.write().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    hook
+}
+
+fn spawn_tap() -> Result<Hook, PlatformError> {
     let (tx, rx) = mpsc::channel::<Result<RunLoopRef, PlatformError>>();
     let thread = std::thread::Builder::new()
         .name("knob-hook".into())

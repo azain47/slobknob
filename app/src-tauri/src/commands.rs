@@ -4,7 +4,7 @@ use knob_core::{Config, MODES};
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
-use crate::{settings, theme, AppState, Theme};
+use crate::{settings, theme, AppState, Lifecycle, Theme};
 
 #[derive(Serialize)]
 pub struct ModeInfo {
@@ -36,6 +36,10 @@ pub fn get_settings(state: State<'_, AppState>) -> SettingsData {
         Err(e) => (state.config.lock().unwrap().clone(), Some(e)),
     };
     let system = Config { accent: "system".into(), ..Config::default() };
+    let (paused, running) = {
+        let lifecycle = state.lifecycle.lock().unwrap();
+        (matches!(*lifecycle, Lifecycle::Paused { .. }), lifecycle.runtime().is_some())
+    };
     SettingsData {
         problems: config.problems(),
         config,
@@ -44,8 +48,8 @@ pub fn get_settings(state: State<'_, AppState>) -> SettingsData {
         system_accent: theme(&system).accent,
         platform: std::env::consts::OS,
         config_path: state.paths.config.display().to_string(),
-        paused: state.paused.load(std::sync::atomic::Ordering::Acquire),
-        running: state.runtime.lock().unwrap().is_some(),
+        paused,
+        running,
     }
 }
 
@@ -82,21 +86,19 @@ fn set_autostart(app: &AppHandle, on: bool) -> Result<(), String> {
 
 #[tauri::command]
 pub fn start_learn(state: State<'_, AppState>) -> Result<(), String> {
-    match state.runtime.lock().unwrap().as_ref() {
-        Some(rt) => {
+    match &*state.lifecycle.lock().unwrap() {
+        Lifecycle::Running(rt) => {
             rt.start_learn();
             Ok(())
         }
-        None if state.paused.load(std::sync::atomic::Ordering::Acquire) => {
-            Err("SlobKnob is paused. Resume it from the menu bar first.".into())
-        }
-        None => Err("The knob hook isn't running yet (Accessibility permission?).".into()),
+        Lifecycle::Paused { .. } => Err("SlobKnob is paused. Resume it from the menu bar first.".into()),
+        _ => Err("The knob hook isn't running yet (Accessibility permission?).".into()),
     }
 }
 
 #[tauri::command]
 pub fn cancel_learn(state: State<'_, AppState>) {
-    if let Some(rt) = state.runtime.lock().unwrap().as_ref() {
+    if let Some(rt) = state.lifecycle.lock().unwrap().runtime() {
         rt.cancel_learn();
     }
 }

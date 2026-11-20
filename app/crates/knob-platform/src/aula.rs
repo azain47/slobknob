@@ -127,17 +127,18 @@ fn run(rx: &mpsc::Receiver<Msg>) {
     let mut out = Receiver::default();
     let mut audio: Option<IMMDeviceEnumerator> = None;
     let mut watch: Option<VolumeWatch> = None;
-    // The glow being held: its frame, next refresh, and when it gives up.
-    let mut glow: Option<(Frame, Instant, Instant)> = None;
-    // The newest frame not sent yet, and the last one sent (to repeat once).
-    let mut pending: Option<Frame> = None;
-    let mut resend: Option<(Instant, Frame)> = None;
+    // What the receiver gets next, and the glow being held (re-sent until it gives up).
+    let mut next = Next::Nothing;
+    let mut glow: Option<Glow> = None;
     loop {
         let wake = [
-            pending.as_ref().map(|_| out.next_send()),
+            match &next {
+                Next::Send(_) => Some(out.next_send()),
+                Next::Repeat { at, .. } => Some(*at),
+                Next::Nothing => None,
+            },
             watch.as_ref().map(|w| w.next_poll),
-            resend.as_ref().map(|(at, _)| *at),
-            glow.as_ref().map(|(_, refresh, _)| *refresh),
+            glow.as_ref().map(|g| g.refresh_at),
         ]
         .into_iter()
         .flatten()
@@ -155,19 +156,21 @@ fn run(rx: &mpsc::Receiver<Msg>) {
         };
         let Some(colors) = *COLORS.lock().unwrap_or_else(PoisonError::into_inner) else {
             // turned off: drop whatever was under way
-            (pending, resend, watch, glow) = (None, None, None, None);
+            (next, watch, glow) = (Next::Nothing, None, None);
             continue;
         };
         let now = Instant::now();
         match msg {
             Some(Msg::Glow(Some(color))) => {
                 let frame = Frame::board(color, GLOW);
-                pending = Some(frame.clone());
-                glow = Some((frame, now + GLOW_REFRESH, now + GLOW_MAX));
+                next = Next::Send(frame.clone());
+                glow = Some(Glow { frame, refresh_at: now + GLOW_REFRESH, until: now + GLOW_MAX });
             }
             // no frame: the keyboard keeps the last glow ~2 s, then its own effect
             Some(Msg::Glow(None)) => glow = None,
-            Some(Msg::Brightness(percent)) => pending = Some(Frame::level(colors.brightness, percent as f32 / 100.0, false)),
+            Some(Msg::Brightness(percent)) => {
+                next = Next::Send(Frame::level(colors.brightness, percent as f32 / 100.0, false));
+            }
             Some(Msg::VolumeKey) => match &mut watch {
                 Some(w) => w.until = now + VOLUME_WATCH,
                 None if com.is_ok() => match VolumeWatch::start(&mut audio, now) {
@@ -180,7 +183,7 @@ fn run(rx: &mpsc::Receiver<Msg>) {
         }
         if let Some(w) = watch.as_mut().filter(|w| now >= w.next_poll) {
             match w.poll(now) {
-                Ok(Some((level, muted))) => pending = Some(Frame::level(colors.volume, level, muted)),
+                Ok(Some((level, muted))) => next = Next::Send(Frame::level(colors.volume, level, muted)),
                 Ok(None) => {}
                 Err(e) => {
                     log::debug!("keyboard lights: reading the volume failed: {e}");
@@ -191,19 +194,21 @@ fn run(rx: &mpsc::Receiver<Msg>) {
         if watch.as_ref().is_some_and(|w| now >= w.until) {
             watch = None;
         }
-        if glow.as_ref().is_some_and(|(_, _, until)| now >= *until) {
+        if glow.as_ref().is_some_and(|g| now >= g.until) {
             glow = None;
-        } else if let Some((frame, refresh, _)) = glow.as_mut().filter(|(_, refresh, _)| now >= *refresh) {
-            *refresh = now + GLOW_REFRESH;
-            pending.get_or_insert_with(|| frame.clone());
-        }
-        if let Some(frame) = pending.take_if(|_| out.ready(now)) {
-            out.send(&frame);
-            resend = Some((Instant::now() + RESEND_AFTER, frame));
-        } else if pending.is_none() && resend.as_ref().is_some_and(|(at, _)| now >= *at) {
-            if let Some((_, frame)) = resend.take() {
-                out.send(&frame);
+        } else if let Some(g) = glow.as_mut().filter(|g| now >= g.refresh_at) {
+            g.refresh_at = now + GLOW_REFRESH;
+            if !matches!(next, Next::Send(_)) {
+                next = Next::Send(g.frame.clone());
             }
+        }
+        match std::mem::replace(&mut next, Next::Nothing) {
+            Next::Send(frame) if out.ready(now) => {
+                out.send(&frame);
+                next = Next::Repeat { at: Instant::now() + RESEND_AFTER, frame };
+            }
+            Next::Repeat { at, frame } if now >= at => out.send(&frame),
+            other => next = other,
         }
     }
 }
@@ -299,6 +304,22 @@ fn receiver_path() -> Option<String> {
         log::debug!("keyboard lights: no AULA F75 receiver");
     }
     crate::windows::device_name(found?.0)
+}
+
+/// What the receiver gets next.
+enum Next {
+    Nothing,
+    /// A new frame, as soon as the receiver is ready.
+    Send(Frame),
+    /// The last frame once more at `at`, in case the radio lost it.
+    Repeat { at: Instant, frame: Frame },
+}
+
+/// A glow being held: re-sent at `refresh_at` until `until`.
+struct Glow {
+    frame: Frame,
+    refresh_at: Instant,
+    until: Instant,
 }
 
 /// A real-time frame: sub-command and data, split over as many packets as needed.

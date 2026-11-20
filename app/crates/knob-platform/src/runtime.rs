@@ -208,7 +208,12 @@ impl Drop for Runtime {
         if std::mem::take(&mut *self.shared.listening.lock().unwrap_or_else(|e| e.into_inner())) {
             let _ = set_device_listener(false);
         }
-        self.shared.stopping.store(true, Ordering::Release);
+        {
+            // Under the engine lock: the timer thread either sees `stopping`
+            // before it waits, or is already waiting and gets the notification.
+            let _engine = self.shared.engine();
+            self.shared.stopping.store(true, Ordering::Release);
+        }
         self.shared.wake.notify_one();
         if let Some(t) = self.timer.take() {
             let _ = t.join();

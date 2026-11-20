@@ -48,8 +48,8 @@ const TABS = [
 let data = null; // get_settings result
 let cfg = null; // the config being edited
 let saveTimer = 0;
-let saving = false;
-let saveAgain = false;
+let saveRun = null; // the save in flight (it also runs saves queued meanwhile), or null
+let saveAgain = false; // a save was requested while one was in flight
 let saveError = "";
 let problems = [];
 let theme = null; // resolved theme for the preview
@@ -183,14 +183,24 @@ function scheduleSave() {
   saveTimer = setTimeout(saveNow, SAVE_DEBOUNCE_MS);
 }
 
-async function saveNow() {
+function saveNow() {
   clearTimeout(saveTimer);
   saveTimer = 0;
-  if (saving) {
+  if (saveRun) {
     saveAgain = true;
-    return;
+    return saveRun;
   }
-  saving = true;
+  saveRun = (async () => {
+    do {
+      saveAgain = false;
+      await saveOnce();
+    } while (saveAgain);
+    saveRun = null;
+  })();
+  return saveRun;
+}
+
+async function saveOnce() {
   setSaveStatus("saving");
   try {
     const res = await invoke("save_settings", { config: cfg });
@@ -204,12 +214,6 @@ async function saveNow() {
   } catch (err) {
     saveError = String(err);
     setSaveStatus("error");
-  } finally {
-    saving = false;
-    if (saveAgain) {
-      saveAgain = false;
-      saveNow();
-    }
   }
 }
 
@@ -316,6 +320,7 @@ function showTab(tab) {
 }
 
 function renderContent() {
+  stopRecording();
   const title = TABS.find(([id]) => id === ui.tab)[1];
   $("title").textContent = title;
   const content = $("content");
@@ -450,13 +455,17 @@ function openPopover(anchor, content, { width = 300, align = "left" } = {}) {
       close();
     }
   };
+  let closed = false;
   function close() {
+    if (closed) return;
+    closed = true;
     pop.remove();
     document.removeEventListener("pointerdown", onDown, true);
     document.removeEventListener("keydown", onKey, true);
-    closePopover = null;
+    if (closePopover === close) closePopover = null;
   }
   setTimeout(() => {
+    if (closed) return;
     document.addEventListener("pointerdown", onDown, true);
     document.addEventListener("keydown", onKey, true);
   });
@@ -665,7 +674,6 @@ function openSlicePicker(anchor, list, exclude, onPick) {
 
 let previewFrame = null;
 let previewReady = false;
-let hudTimer = 0;
 
 function makePreviewFrame() {
   if (!previewFrame) {
@@ -765,7 +773,6 @@ function onKnobPreview({ key, down }) {
     const s = sliceInfo(m.list.filter((id) => sliceInfo(id))[ui.previewSel]);
     if (!s) return;
     post({ type: "hud", mode: s.id, text: s.name, icon: s.icon, color: s.color });
-    clearTimeout(hudTimer);
   }
   document.querySelector(".preview-card")?.classList.add("live");
 }
@@ -1656,10 +1663,11 @@ function cancelLearn() {
 }
 
 function onLearn(ev) {
+  // after Cancel or a failed start the backend can still send a late event
+  if (ui.learn.state !== "learning") return;
   if (ev.type === "prompt") ui.learn = { ...ui.learn, state: "learning", step: ev.step };
   else if (ev.type === "done") ui.learn = { state: "done", step: null, keys: ev.keys, device: ev.device ?? null, error: "" };
   else if (ev.type === "cancelled") {
-    if (ui.learn.state !== "learning") return;
     ui.learn = { state: "idle", step: null, keys: null, device: null, error: "Timed out. Nothing changed." };
   }
   if (ui.tab === "knob") renderContent();
@@ -1983,7 +1991,9 @@ async function boot() {
   await win?.onCloseRequested(async () => {
     stopRecording();
     if (ui.learn.state === "learning") cancelLearn();
-    if (saveTimer && !blockedByParseError) await saveNow();
+    if (blockedByParseError) return;
+    if (saveTimer) await saveNow();
+    else if (saveRun) await saveRun;
   });
 }
 
