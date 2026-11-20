@@ -1772,6 +1772,13 @@ function renderKnob() {
         "While this window is in front, turning the knob only moves the preview wheel. Turn off to use the knob as usual here too.",
         toggle(cfg.preview_in_settings, (v) => { cfg.preview_in_settings = v; changed(); }),
       ),
+      data.platform === "windows"
+        ? row(
+            "Keyboard lights",
+            "AULA F75 on its 2.4G receiver: the keys glow in the highlighted slice's colour while the wheel is open, and F1–F12 show volume and brightness while they change.",
+            toggle(cfg.keyboard_lights, (v) => { cfg.keyboard_lights = v; changed(); }),
+          )
+        : null,
       row(
         "Only use the knob's keyboard",
         h(

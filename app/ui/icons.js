@@ -120,7 +120,8 @@ const UI_SHAPES = {
   "plus": '<path d="M5 12h14"/><path d="M12 5v14"/>',
 };
 
-// Theme accent "pastel": every mode gets its own soft color.
+// Theme accent "pastel": every mode gets its own soft color. The keyboard lights use the same
+// table (src-tauri/src/lights.rs); change both together.
 export const PASTEL = {
   volume: "#f5adb9",
   brightness: "#f5e3ad",

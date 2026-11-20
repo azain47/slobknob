@@ -136,6 +136,10 @@ pub struct Config {
     /// keyboards keep working. Needs the platform's device listener (macOS:
     /// Input Monitoring permission).
     pub only_knob_device: bool,
+    /// Use the keyboard's own lights where SlobKnob can (Windows: AULA F75 on
+    /// its 2.4G receiver): glow in the wheel's highlighted colour, show volume
+    /// and brightness on F1-F12.
+    pub keyboard_lights: bool,
     pub launch_at_login: bool,
 }
 
@@ -175,6 +179,7 @@ impl Default for Config {
             preview_in_settings: true,
             knob_device: None,
             only_knob_device: false,
+            keyboard_lights: true,
             launch_at_login: false,
         }
     }

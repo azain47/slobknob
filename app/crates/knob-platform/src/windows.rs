@@ -292,6 +292,11 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             if decision == Decision::Swallow {
                 return LRESULT(1);
             }
+            // On its way to Windows: the keyboard's lights show the new level.
+            let down = matches!(wparam.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            if down && matches!(vk, VK_VOLUME_UP | VK_VOLUME_DOWN | VK_VOLUME_MUTE) {
+                crate::aula::volume_key();
+            }
         }
     }
     // SAFETY: forwarding the arguments we were called with.
@@ -745,12 +750,20 @@ fn run_listener(ready: &mpsc::Sender<Result<u32, PlatformError>>) {
 /// report from each doesn't wait on the (possibly slow) lookup and miss
 /// [`MATCH_WAIT`]. Devices attached later are looked up on first report.
 fn known_consumer_devices() -> HashMap<isize, HidDevice> {
-    let mut devices = HashMap::new();
+    hid_devices()
+        .into_iter()
+        .filter(|(_, hid)| hid.usUsagePage == 0x0C && hid.usUsage == 0x01)
+        .map(|(handle, _)| (handle.0 as isize, HidDevice::open(handle)))
+        .collect()
+}
+
+/// Every HID top-level collection attached, with its Raw Input device info.
+pub(crate) fn hid_devices() -> Vec<(HANDLE, RID_DEVICE_INFO_HID)> {
     let entry_size = size_of::<RAWINPUTDEVICELIST>() as u32;
     let mut count = 0u32;
     // SAFETY: a null buffer asks for the count.
     if unsafe { GetRawInputDeviceList(None, &mut count, entry_size) } == u32::MAX || count == 0 {
-        return devices;
+        return Vec::new();
     }
     // A little slack in case a device arrives between the two calls.
     let mut list = vec![RAWINPUTDEVICELIST::default(); count as usize + 4];
@@ -758,15 +771,13 @@ fn known_consumer_devices() -> HashMap<isize, HidDevice> {
     // SAFETY: list holds cap entries.
     let got = unsafe { GetRawInputDeviceList(Some(list.as_mut_ptr()), &mut cap, entry_size) };
     if got == u32::MAX {
-        return devices;
+        return Vec::new();
     }
-    for entry in list.iter().take(got as usize).filter(|e| e.dwType == RIM_TYPEHID) {
-        let consumer = device_hid_info(entry.hDevice).is_some_and(|h| h.usUsagePage == 0x0C && h.usUsage == 0x01);
-        if consumer {
-            devices.insert(entry.hDevice.0 as isize, HidDevice::open(entry.hDevice));
-        }
-    }
-    devices
+    list.iter()
+        .take(got as usize)
+        .filter(|e| e.dwType == RIM_TYPEHID)
+        .filter_map(|e| Some((e.hDevice, device_hid_info(e.hDevice)?)))
+        .collect()
 }
 
 fn read_raw_input(handle: HRAWINPUT, devices: &mut HashMap<isize, HidDevice>) {
@@ -907,7 +918,7 @@ fn parse_report_bytes(report: &[u8]) -> Vec<MediaKey> {
     body.as_chunks::<2>().0.iter().filter_map(|&pair| usage_key(u16::from_le_bytes(pair))).collect()
 }
 
-fn device_name(handle: HANDLE) -> Option<String> {
+pub(crate) fn device_name(handle: HANDLE) -> Option<String> {
     let mut len = 0u32;
     // SAFETY: a null buffer asks for the length in characters.
     unsafe { GetRawInputDeviceInfoW(Some(handle), RIDI_DEVICENAME, None, &mut len) };
@@ -1027,7 +1038,11 @@ pub fn perform(action: &Action) {
             // Our own window in front is the settings window, where the app
             // makes the knob keys hotkeys: a keystroke would land on the
             // hotkey again. The shell does the same thing without one.
-            Some(_) if own_foreground() && shell_app_command(*media) => {}
+            Some(_) if own_foreground() && shell_app_command(*media) => {
+                if matches!(media, MediaKey::VolumeUp | MediaKey::VolumeDown | MediaKey::Mute) {
+                    crate::aula::volume_key();
+                }
+            }
             Some(vk) => tap(&[], vk),
             None => brightness_step(if *media == MediaKey::BrightnessUp { 1 } else { -1 }),
         },
@@ -1507,7 +1522,10 @@ fn brightness_loop(rx: &mpsc::Receiver<i32>) {
         }
         let Some(connection) = &wmi else { continue };
         match connection.change(steps.saturating_mul(10)) {
-            Ok((from, to)) => log::debug!("brightness {from} -> {to} % in {:?}", started.elapsed()),
+            Ok((from, to)) => {
+                log::debug!("brightness {from} -> {to} % in {:?}", started.elapsed());
+                crate::aula::brightness_changed(to);
+            }
             Err(e) => {
                 log::warn!("brightness change failed: {e}");
                 wmi = None; // reconnect next time

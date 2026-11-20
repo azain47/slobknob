@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod commands;
+mod lights;
 mod settings;
 mod settings_window;
 mod tray;
@@ -105,7 +106,9 @@ fn start_runtime(app: &AppHandle) -> Result<Runtime, PlatformError> {
                     UiEvent::Close => set_escape(&ui_app, false),
                     _ => {}
                 }
-                ui_app.state::<AppState>().wheel_window.handle(ui);
+                let state = ui_app.state::<AppState>();
+                lights::on_ui(&state.config.lock().unwrap(), &ui);
+                state.wheel_window.handle(ui);
             }),
             on_mode: Box::new(move |wheel, mode| {
                 let state = mode_app.state::<AppState>();
@@ -229,6 +232,7 @@ pub fn reload_config(app: &AppHandle) {
     let cfg = settings::load_config(&state.paths.config);
     *state.config.lock().unwrap() = cfg.clone();
     let _ = app.emit_to(wheel_window::LABEL, "knob-theme", theme(&cfg));
+    lights::apply(&cfg);
     if let Some(rt) = state.runtime.lock().unwrap().as_ref() {
         rt.set_config(cfg);
     }
@@ -276,6 +280,7 @@ fn main() {
             let first_run = !paths.config.exists();
             let config = settings::load_config(&paths.config);
             let modes = settings::load_modes(&paths.state);
+            lights::apply(&config);
             app.manage(AppState {
                 paths,
                 config: Mutex::new(config),

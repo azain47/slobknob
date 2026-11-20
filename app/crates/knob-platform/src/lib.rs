@@ -30,6 +30,11 @@
 //! - [`accent_color`]: the OS accent color, if there is one.
 //! - [`input_permission`]: whether the hook is allowed to run (macOS
 //!   Accessibility); with `prompt` the OS asks the user.
+//! - [`set_keyboard_lights`] / [`glow_keyboard`]: drive the knob keyboard's
+//!   own lights (Windows: an AULA F75 through its 2.4G receiver; elsewhere
+//!   they do nothing). While on, volume keys and brightness changes show the
+//!   new level on the keyboard for a moment, and a glow can be held (the
+//!   wheel's highlight).
 
 use std::fmt;
 
@@ -49,6 +54,14 @@ pub enum HookEvent {
 
 /// Runs on the hook thread for every [`HookEvent`].
 pub type KeyHandler = Box<dyn Fn(HookEvent) -> Decision + Send + Sync + 'static>;
+
+/// Colours for the keyboard's level bar, as the wheel draws those modes. The
+/// platform adapts screen colours to LEDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardLights {
+    pub volume: [u8; 3],
+    pub brightness: [u8; 3],
+}
 
 #[derive(Debug)]
 pub enum PlatformError {
@@ -92,6 +105,19 @@ pub use windows::{
     accent_color, device_permission, frontmost_app, input_permission, is_foreground, perform, set_device_listener, start_hook,
     Hook,
 };
+#[cfg(windows)]
+mod aula;
+#[cfg(windows)]
+pub use aula::{glow_keyboard, set_keyboard_lights};
+
+/// Keyboard lights: None turns them off.
+#[cfg(not(windows))]
+pub fn set_keyboard_lights(_lights: Option<KeyboardLights>) {}
+
+/// While the lights are on, the whole keyboard glows softly in `color` until
+/// the next call; None ends the glow.
+#[cfg(not(windows))]
+pub fn glow_keyboard(_color: Option<[u8; 3]>) {}
 
 #[cfg(not(any(target_os = "macos", windows)))]
 mod unsupported;

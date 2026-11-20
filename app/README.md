@@ -37,6 +37,12 @@ MacBook's own keys) keep doing volume whatever the knob's mode is. SlobKnob matc
 the HID report that sent it, which needs Input Monitoring permission on macOS. It cannot separate the
 knob from volume keys on the *same* keyboard if those send identical reports (likely, not yet checked).
 
+**Keyboard lights** (Windows, AULA F75 on its 2.4G receiver; Settings > Knob): while the wheel is
+open the keys glow softly in the highlighted slice's colour, and F1–F12 show the volume or screen
+brightness as a bar while it changes. These are the keyboard's live-preview frames: nothing is saved
+to the keyboard, and about 2 s after the last one it goes back to its own lighting effect. Wired and
+Bluetooth connections are not supported.
+
 Also: invert direction, smooth scrolling that speeds up when you spin fast, launch at login, pause.
 
 ## Layout
